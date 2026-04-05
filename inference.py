@@ -34,25 +34,21 @@ import numpy as np
 try:
     from models import ProteinAction, ProteinObservation
     from server.xero_environment import ProteinFoldingEnvironment
-    from test import build_action_candidates, format_action
 except ImportError:
     from xero.models import ProteinAction, ProteinObservation
     from xero.server.xero_environment import ProteinFoldingEnvironment
-    from xero.test import build_action_candidates, format_action
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-#API_BASE_URL = os.getenv("API_BASE_URL")  
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-#API_KEY = os.getenv("HF_TOKEN")
-MODEL_NAME = os.getenv("MODEL_NAME")
+MODEL_NAME = os.getenv("MODEL_NAME", "<your-actual-model-name>")
+HF_TOKEN = os.getenv("HF_TOKEN")
 TASK_ID = os.getenv("TASK_ID", "task_2")
 EPISODE_SEED = int(os.getenv("EPISODE_SEED", "7"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "3"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
 SHORTLIST_SIZE = int(os.getenv("SHORTLIST_SIZE", "8"))
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "protein-env:latest")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 ACTION_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 class ProteinFoldingEnvClient(EnvClient[ProteinAction, ProteinObservation, Any]):
@@ -125,6 +121,74 @@ SYSTEM_PROMPT = textwrap.dedent(
     - Do not add explanations.
     """
 ).strip()
+
+
+def build_action_candidates(length: int) -> list[ProteinAction]:
+    """Generate legal action candidates for the current chain length."""
+    if length <= 0:
+        return [ProteinAction(action_type="end_move_forward")]
+
+    candidates: list[ProteinAction] = []
+    angle_deltas = [-30.0, -15.0, 15.0, 30.0]
+    residue_indices = sorted({0, max(0, length // 3), max(0, length // 2), max(0, length - 1)})
+
+    for idx in residue_indices:
+        for delta in angle_deltas:
+            candidates.append(
+                ProteinAction(action_type="rotate_phi", residue_index=idx, angle_delta=delta)
+            )
+            candidates.append(
+                ProteinAction(action_type="rotate_psi", residue_index=idx, angle_delta=delta)
+            )
+
+    pivot_indices = sorted({0, max(0, length // 2), max(0, length - 2)})
+    for idx in pivot_indices:
+        for delta in angle_deltas:
+            candidates.append(
+                ProteinAction(action_type="pivot_rotation", residue_index=idx, angle_delta=delta)
+            )
+
+    if length >= 3:
+        segments = {
+            (0, min(length - 1, 3)),
+            (max(0, length // 2 - 1), min(length - 1, length // 2 + 1)),
+            (max(0, length - 4), length - 1),
+        }
+        for start, end in sorted(segments):
+            if start >= end:
+                continue
+            candidates.append(
+                ProteinAction(action_type="segment_flip", segment_start=start, segment_end=end)
+            )
+            for delta in (-20.0, 20.0):
+                candidates.append(
+                    ProteinAction(
+                        action_type="crankshaft_move",
+                        segment_start=start,
+                        segment_end=end,
+                        angle_delta=delta,
+                    )
+                )
+
+    for delta in angle_deltas:
+        candidates.append(ProteinAction(action_type="end_move_forward", angle_delta=delta))
+        candidates.append(ProteinAction(action_type="end_move_backward", angle_delta=delta))
+
+    return candidates
+
+
+def format_action(action: ProteinAction) -> str:
+    """Create a compact string for action logging and prompt history."""
+    parts = [f"action_type={action.action_type}"]
+    if action.residue_index is not None:
+        parts.append(f"residue_index={action.residue_index}")
+    if action.segment_start is not None:
+        parts.append(f"segment_start={action.segment_start}")
+    if action.segment_end is not None:
+        parts.append(f"segment_end={action.segment_end}")
+    if action.angle_delta is not None:
+        parts.append(f"angle_delta={float(action.angle_delta):.1f}")
+    return " ".join(parts)
 
 
 def summarize_observation(observation: ProteinObservation) -> str:
@@ -319,7 +383,7 @@ def ensure_required_env() -> None:
         for name, value in (
             ("API_BASE_URL", API_BASE_URL),
             ("MODEL_NAME", MODEL_NAME),
-            ("HF_TOKEN", API_KEY),
+            ("HF_TOKEN", HF_TOKEN),
         )
         if not value
     ]
@@ -331,15 +395,11 @@ def ensure_required_env() -> None:
 async def main() -> None:
     """Run one inference episode with LLM-selected structural actions."""
     ensure_required_env()
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    env = await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME or "protein-env:latest")
     tasks_to_evaluate = ["task_1", "task_2", "task_3"]
     try:
         for current_task in tasks_to_evaluate:
-            print(f"\n\n{'='*60}")
-            print(f"EVALUATING: {current_task.upper()}")
-            print(f"{'='*60}")
-
             # 1. Initialize Environment for the specific task
             
             result = await env.reset(seed=EPISODE_SEED, task_id=current_task)
@@ -362,13 +422,13 @@ async def main() -> None:
 
             for step in range(1, loop_limit + 1):
                 if episode_done:
-                    print("Environment signalled done. Stopping early.")
                     break
                 candidates = build_action_candidates(len(observation.coordinates))
                 shortlisted = shortlist_candidates(observation, candidates, SHORTLIST_SIZE, current_task)
                 candidate_actions = [item[0] for item in shortlisted]
                 # 3. Build Prompt (including history so LLM learns from steps)
                 user_prompt = build_user_prompt(observation, shortlisted, history,current_task)
+                step_error = "null"
 
                 try:
                     completion = client.chat.completions.create(
@@ -383,7 +443,8 @@ async def main() -> None:
                     )
                     response_text = completion.choices[0].message.content or ""
                 except Exception as exc:  # noqa: BLE001
-                    print(f"Model request failed ({exc}). Falling back to strongest heuristic action.")
+                    # Keep stdout structured; include failures via STEP error field.
+                    step_error = str(exc).replace(" ", "_")
                     response_text = ""
 
                 chosen_action = parse_action_response(response_text, candidate_actions)
@@ -401,7 +462,7 @@ async def main() -> None:
                 done_val = str(episode_done).lower()
                 energy_val = float(getattr(observation, "energy", 0.0))
                 print(
-                    f"[STEP] step={step} action={action_desc} reward={reward:.4f} energy={energy_val:.2f} done={done_val} error=null",
+                    f"[STEP] step={step} action={action_desc} reward={reward:.4f} energy={energy_val:.2f} done={done_val} error={step_error}",
                     flush=True,
                 )
                 history.append(f"Step {step}: {format_action(chosen_action)} -> reward {reward:.2f}")

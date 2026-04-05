@@ -1,0 +1,10 @@
+# Handle line endings automatically
+* text=auto
+
+# Ensure these files ALWAYS use LF (Linux format)
+# This is crucial for Docker and Python tools
+*.py text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
