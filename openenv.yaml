@@ -1,0 +1,29 @@
+spec_version: 1
+name: xero
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+tasks:
+  - id: task_1
+    name: Protein Folding Task 1
+    protein_length: 8
+    goal: reduce energy by 30%
+    scoring:
+      formula: "(energy_reduction_ratio + hydrophobic_contact_ratio + stability_score) / 3"
+      range: [0.0, 1.0]
+  - id: task_2
+    name: Protein Folding Task 2
+    protein_length: 12
+    goal: form hydrophobic core
+    scoring:
+      formula: "(energy_reduction_ratio + hydrophobic_contact_ratio + stability_score) / 3"
+      range: [0.0, 1.0]
+  - id: task_3
+    name: Protein Folding Task 3
+    protein_length: 20
+    goal: reach minimum energy
+    scoring:
+      formula: "(energy_reduction_ratio + hydrophobic_contact_ratio + stability_score) / 3"
+      range: [0.0, 1.0]
