@@ -34,9 +34,11 @@ import numpy as np
 try:
     from models import ProteinAction, ProteinObservation
     from server.xero_environment import ProteinFoldingEnvironment
+    from test import build_action_candidates, format_action
 except ImportError:
     from xero.models import ProteinAction, ProteinObservation
     from xero.server.xero_environment import ProteinFoldingEnvironment
+    from xero.test import build_action_candidates, format_action
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -121,74 +123,6 @@ SYSTEM_PROMPT = textwrap.dedent(
     - Do not add explanations.
     """
 ).strip()
-
-
-def build_action_candidates(length: int) -> list[ProteinAction]:
-    """Generate legal action candidates for the current chain length."""
-    if length <= 0:
-        return [ProteinAction(action_type="end_move_forward")]
-
-    candidates: list[ProteinAction] = []
-    angle_deltas = [-30.0, -15.0, 15.0, 30.0]
-    residue_indices = sorted({0, max(0, length // 3), max(0, length // 2), max(0, length - 1)})
-
-    for idx in residue_indices:
-        for delta in angle_deltas:
-            candidates.append(
-                ProteinAction(action_type="rotate_phi", residue_index=idx, angle_delta=delta)
-            )
-            candidates.append(
-                ProteinAction(action_type="rotate_psi", residue_index=idx, angle_delta=delta)
-            )
-
-    pivot_indices = sorted({0, max(0, length // 2), max(0, length - 2)})
-    for idx in pivot_indices:
-        for delta in angle_deltas:
-            candidates.append(
-                ProteinAction(action_type="pivot_rotation", residue_index=idx, angle_delta=delta)
-            )
-
-    if length >= 3:
-        segments = {
-            (0, min(length - 1, 3)),
-            (max(0, length // 2 - 1), min(length - 1, length // 2 + 1)),
-            (max(0, length - 4), length - 1),
-        }
-        for start, end in sorted(segments):
-            if start >= end:
-                continue
-            candidates.append(
-                ProteinAction(action_type="segment_flip", segment_start=start, segment_end=end)
-            )
-            for delta in (-20.0, 20.0):
-                candidates.append(
-                    ProteinAction(
-                        action_type="crankshaft_move",
-                        segment_start=start,
-                        segment_end=end,
-                        angle_delta=delta,
-                    )
-                )
-
-    for delta in angle_deltas:
-        candidates.append(ProteinAction(action_type="end_move_forward", angle_delta=delta))
-        candidates.append(ProteinAction(action_type="end_move_backward", angle_delta=delta))
-
-    return candidates
-
-
-def format_action(action: ProteinAction) -> str:
-    """Create a compact string for action logging and prompt history."""
-    parts = [f"action_type={action.action_type}"]
-    if action.residue_index is not None:
-        parts.append(f"residue_index={action.residue_index}")
-    if action.segment_start is not None:
-        parts.append(f"segment_start={action.segment_start}")
-    if action.segment_end is not None:
-        parts.append(f"segment_end={action.segment_end}")
-    if action.angle_delta is not None:
-        parts.append(f"angle_delta={float(action.angle_delta):.1f}")
-    return " ".join(parts)
 
 
 def summarize_observation(observation: ProteinObservation) -> str:
