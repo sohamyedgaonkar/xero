@@ -43,7 +43,7 @@ import numpy as np
 
 from models import ProteinAction, ProteinObservation
 from server.xero_environment import ProteinFoldingEnvironment
-#from test import build_action_candidates, format_action
+
 
 
 
