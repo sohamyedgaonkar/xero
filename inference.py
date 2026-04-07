@@ -40,14 +40,11 @@ from openenv.core.env_client import EnvClient
 from openenv.core.client_types import StepResult
 import numpy as np
 
-try:
-    from models import ProteinAction, ProteinObservation
-    from server.xero_environment import ProteinFoldingEnvironment
-    from test import build_action_candidates, format_action
-except ImportError:
-    from xero.models import ProteinAction, ProteinObservation
-    from xero.server.xero_environment import ProteinFoldingEnvironment
-    from xero.test import build_action_candidates, format_action
+
+from models import ProteinAction, ProteinObservation
+from server.xero_environment import ProteinFoldingEnvironment
+#from test import build_action_candidates, format_action
+
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -224,6 +221,86 @@ def shortlist_candidates(
 
     ranked.sort(key=lambda item: item[2], reverse=True)
     return ranked[: max(1, shortlist_size)]
+
+def build_action_candidates(length: int) -> list[ProteinAction]:
+    """Create a diverse but bounded set of valid actions for the current chain."""
+    candidates: list[ProteinAction] = []
+    angle_choices = (-60.0, -30.0, 30.0, 60.0)
+
+    for residue_index in range(1, max(length - 1, 1)):
+        for angle_delta in angle_choices:
+            candidates.append(
+                ProteinAction(
+                    action_type="rotate_phi",
+                    residue_index=residue_index,
+                    angle_delta=angle_delta,
+                )
+            )
+            candidates.append(
+                ProteinAction(
+                    action_type="rotate_psi",
+                    residue_index=residue_index,
+                    angle_delta=angle_delta,
+                )
+            )
+
+    for residue_index in range(0, max(length - 2, 1)):
+        for angle_delta in angle_choices:
+            candidates.append(
+                ProteinAction(
+                    action_type="pivot_rotation",
+                    residue_index=residue_index,
+                    angle_delta=angle_delta,
+                )
+            )
+
+    window_sizes = (3, 4, 5)
+    for window_size in window_sizes:
+        if window_size > length:
+            continue
+        step = 1 if length <= 12 else 2
+        for start in range(0, length - window_size + 1, step):
+            end = start + window_size - 1
+            candidates.append(
+                ProteinAction(
+                    action_type="segment_flip",
+                    segment_start=start,
+                    segment_end=end,
+                )
+            )
+            for angle_delta in (-45.0, 45.0):
+                candidates.append(
+                    ProteinAction(
+                        action_type="crankshaft_move",
+                        segment_start=start,
+                        segment_end=end,
+                        angle_delta=angle_delta,
+                    )
+                )
+
+    for angle_delta in (-45.0, -20.0, 20.0, 45.0):
+        candidates.append(
+            ProteinAction(
+                action_type="end_move_forward",
+                angle_delta=angle_delta,
+            )
+        )
+        candidates.append(
+            ProteinAction(
+                action_type="end_move_backward",
+                angle_delta=angle_delta,
+            )
+        )
+
+    return candidates
+def format_action(action: ProteinAction) -> str:
+    """Format an action in a compact human-readable way."""
+    return (
+        f"{action.action_type} "
+        f"(residue={action.residue_index}, "
+        f"segment={action.segment_start}:{action.segment_end}, "
+        f"delta={action.angle_delta})"
+    )
 
 
 
