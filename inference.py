@@ -19,11 +19,20 @@ import re
 import textwrap
 from typing import Any
 import sys
+repo_root = os.path.dirname(os.path.abspath(__file__))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+# If 'xero' is a subfolder, ensure it is also in the path
+xero_path = os.path.join(repo_root, "xero")
+if os.path.exists(xero_path) and xero_path not in sys.path:
+    sys.path.insert(0, xero_path)
+# ==============================================================
 from dotenv import load_dotenv
 load_dotenv() # Load your OpenAI key from .env
 
 # ADD THIS: Ensures the script can find the 'xero' folder
-sys.path.append(os.path.dirname(__file__))
+#sys.path.append(os.path.dirname(__file__))
 
 from openai import OpenAI
 import asyncio  # Required for Docker lifecycle
@@ -330,7 +339,7 @@ async def main() -> None:
     """Run one inference episode with LLM-selected structural actions."""
     ensure_required_env()
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-    env = await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME or "protein-env:latest")
+    env = await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
     tasks_to_evaluate = ["task_1", "task_2", "task_3"]
     try:
         for current_task in tasks_to_evaluate:
