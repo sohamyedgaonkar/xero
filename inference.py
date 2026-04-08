@@ -4,7 +4,7 @@ MANDATORY
 - Before running, define the following environment variables:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
-    HF_TOKEN       Your Hugging Face / API key.
+    API_KEY        The validator-injected API key for the LLM proxy.
 
 - This script is named `inference.py` and is placed in the project root.
 - All LLM calls are made through the OpenAI client.
@@ -38,9 +38,9 @@ from models import ProteinAction, ProteinObservation
 from server.xero_environment import ProteinFoldingEnvironment
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+API_BASE_URL = os.getenv("API_BASE_URL")
 MODEL_NAME = os.getenv("MODEL_NAME", "<your-actual-model-name>")
-HF_TOKEN = os.getenv("HF_TOKEN")
+API_KEY = os.getenv("API_KEY")
 TASK_ID = os.getenv("TASK_ID", "task_2")
 EPISODE_SEED = int(os.getenv("EPISODE_SEED", "7"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "3"))
@@ -48,6 +48,7 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
 SHORTLIST_SIZE = int(os.getenv("SHORTLIST_SIZE", "8"))
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL") or os.getenv("ENV_BASE_URL")
 
 ACTION_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -408,7 +409,7 @@ def ensure_required_env() -> None:
         for name, value in (
             ("API_BASE_URL", API_BASE_URL),
             ("MODEL_NAME", MODEL_NAME),
-            ("HF_TOKEN", HF_TOKEN),
+            ("API_KEY", API_KEY),
         )
         if not value
     ]
@@ -417,103 +418,116 @@ def ensure_required_env() -> None:
         raise RuntimeError(f"Missing required environment variables: {missing_text}")
 
 
+def _clean_error_message(exc: Exception) -> str:
+    return " ".join(str(exc).split())
+
+
+async def connect_env() -> ProteinFoldingEnvClient:
+    """Create an environment client using URL if provided, else docker image."""
+    if OPENENV_BASE_URL:
+        for method_name in ("from_url", "from_base_url", "from_endpoint"):
+            method = getattr(ProteinFoldingEnvClient, method_name, None)
+            if method is None:
+                continue
+            try:
+                client = method(OPENENV_BASE_URL)
+                if asyncio.iscoroutine(client):
+                    client = await client
+                return client
+            except TypeError:
+                continue
+
+    if LOCAL_IMAGE_NAME:
+        return await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
+
+    raise RuntimeError(
+        "No environment connection configured. Set LOCAL_IMAGE_NAME for docker or OPENENV_BASE_URL/ENV_BASE_URL for HTTP."
+    )
+
+
 async def main() -> None:
     """Run one inference episode with LLM-selected structural actions."""
-    """Run one inference episode with LLM-selected structural actions."""
     ensure_required_env()
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-    env = await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
-    tasks_to_evaluate = ["task_1", "task_2", "task_3"]
+    client = OpenAI(base_url=os.environ["API_BASE_URL"], api_key=os.environ["API_KEY"])
+    current_task = TASK_ID
+    steps_taken = 0
+    rewards: list[float] = []
+    final_score = 0.0
+    success = False
+    env: ProteinFoldingEnvClient | None = None
+    startup_error: str | None = None
+    log_start(task=current_task, env="protein_folding", model=MODEL_NAME)
     try:
-        for current_task in tasks_to_evaluate:
-            # 1. Initialize Environment for the specific task
-            
-            result = await env.reset(seed=EPISODE_SEED, task_id=current_task)
+        try:
+            env = await connect_env()
+        except Exception as exc:  # noqa: BLE001
+            startup_error = _clean_error_message(exc)
+            return
+
+        result = await env.reset(seed=EPISODE_SEED, task_id=current_task)
+        observation = result.observation
+        episode_done = bool(result.done if result.done is not None else getattr(observation, "done", False))
+        initial_energy = float(observation.energy)
+
+        history: list[str] = []
+        loop_limit = MAX_STEPS if current_task != "task_3" else max(MAX_STEPS, 15)
+
+        for step in range(1, loop_limit + 1):
+            if episode_done:
+                break
+
+            candidates = build_action_candidates(len(observation.coordinates))
+            shortlisted = shortlist_candidates(observation, candidates, SHORTLIST_SIZE, current_task)
+            candidate_actions = [item[0] for item in shortlisted]
+            user_prompt = build_user_prompt(observation, shortlisted, history, current_task)
+            step_error: str | None = None
+
+            try:
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                response_text = completion.choices[0].message.content or ""
+            except Exception as exc:  # noqa: BLE001
+                step_error = str(exc)
+                response_text = ""
+
+            chosen_action = parse_action_response(response_text, candidate_actions)
+            result = await env.step(chosen_action)
             observation = result.observation
             episode_done = bool(result.done if result.done is not None else getattr(observation, "done", False))
-            initial_energy = float(observation.energy)
-            print(f"[START] task={current_task} env=protein_folding model={MODEL_NAME}", flush=True)
 
-            
+            reward = float(result.reward if result.reward is not None else getattr(observation, "reward", 0.0))
+            rewards.append(reward)
+            steps_taken = step
+            action_desc = format_action(chosen_action)
 
-            # History tracks the trajectory to help the LLM reason
-            history: list[str] = []
-            rewards: list[float] = []
-            
-            # Determine how many steps to allow based on task complexity
-            # Task 3 runs for the full duration (50+ steps) as requested
-            loop_limit = MAX_STEPS if current_task != "task_3" else max(MAX_STEPS, 15)
-        
-        
-
-            for step in range(1, loop_limit + 1):
-                if episode_done:
-                    break
-                candidates = build_action_candidates(len(observation.coordinates))
-                shortlisted = shortlist_candidates(observation, candidates, SHORTLIST_SIZE, current_task)
-                candidate_actions = [item[0] for item in shortlisted]
-                # 3. Build Prompt (including history so LLM learns from steps)
-                user_prompt = build_user_prompt(observation, shortlisted, history,current_task)
-                step_error = "null"
-
-                try:
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        temperature=TEMPERATURE,
-                        max_completion_tokens=MAX_TOKENS,
-            
-                    )
-                    response_text = completion.choices[0].message.content or ""
-                except Exception as exc:  # noqa: BLE001
-                    # Keep stdout structured; include failures via STEP error field.
-                    step_error = str(exc).replace(" ", "_")
-                    response_text = ""
-
-                chosen_action = parse_action_response(response_text, candidate_actions)
-                result = await env.step(chosen_action)
-                observation = result.observation
-                episode_done = bool(result.done if result.done is not None else getattr(observation, "done", False))
-
-                reward = float(
-                    result.reward
-                    if result.reward is not None
-                    else getattr(observation, "reward", 0.0)
-                )
-                rewards.append(reward)
-                action_desc = format_action(chosen_action).replace(" ", "_")
-                done_val = str(episode_done).lower()
-                energy_val = float(getattr(observation, "energy", 0.0))
-                print(
-                    f"[STEP] step={step} action={action_desc} reward={reward:.4f} energy={energy_val:.2f} done={done_val} error={step_error}",
-                    flush=True,
-                )
-                history.append(f"Step {step}: {format_action(chosen_action)} -> reward {reward:.2f}")
-
-                
-
-            
-        
-
-            # Final Score calculation
-            metadata_score = float(getattr(observation, "metadata", {}).get("score", 0.0) or 0.0)
-            final_score = (
-                metadata_score
-                if metadata_score > 0.0
-                else estimate_score_from_observation(observation, initial_energy)
+            log_step(
+                step=step,
+                action=action_desc,
+                reward=reward,
+                done=episode_done,
+                error=step_error,
             )
-            success = str(final_score >= 0.7).lower() # Example threshold
-            
-            # [END] line is MANDATORY
-            # Format: [END] success=<bool> steps=<n> score=<0.000> rewards=<r1,r2,rn>
-            rewards_str = ",".join([f"{r:.4f}" for r in rewards])
-            print(f"[END] success={success} steps={len(rewards)} score={final_score:.3f} rewards={rewards_str}", flush=True)
-    finally:
+            history.append(f"Step {step}: {action_desc} -> reward {reward:.2f}")
 
-        await env.close()
+        metadata_score = float(getattr(observation, "metadata", {}).get("score", 0.0) or 0.0)
+        final_score = metadata_score if metadata_score > 0.0 else estimate_score_from_observation(observation, initial_energy)
+        final_score = max(0.0, min(1.0, final_score))
+        success = final_score >= 0.7
+    finally:
+        try:
+            if env is not None:
+                await env.close()
+        finally:
+            if startup_error:
+                log_step(step=1, action="startup", reward=0.0, done=True, error=startup_error)
+            log_end(success=success, steps=steps_taken, score=final_score, rewards=rewards)
 
 
 if __name__ == "__main__":
