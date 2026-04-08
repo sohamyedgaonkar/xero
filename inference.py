@@ -5,6 +5,7 @@ MANDATORY
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     API_KEY        The validator-injected API key for the LLM proxy.
+    HF_TOKEN       (Alternative) Your Hugging Face / API key.
 
 - This script is named `inference.py` and is placed in the project root.
 - All LLM calls are made through the OpenAI client.
@@ -38,9 +39,9 @@ from models import ProteinAction, ProteinObservation
 from server.xero_environment import ProteinFoldingEnvironment
 
 
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME", "<your-actual-model-name>")
-API_KEY = os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-70B-Instruct")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 TASK_ID = os.getenv("TASK_ID", "task_2")
 EPISODE_SEED = int(os.getenv("EPISODE_SEED", "7"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "3"))
@@ -49,7 +50,6 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
 SHORTLIST_SIZE = int(os.getenv("SHORTLIST_SIZE", "8"))
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL") or os.getenv("ENV_BASE_URL")
-
 ACTION_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -402,67 +402,24 @@ def parse_action_response(
     return candidate_actions[0]
 
 
-def ensure_required_env() -> None:
-    """Check the required model configuration."""
-    missing = [
-        name
-        for name, value in (
-            ("API_BASE_URL", API_BASE_URL),
-            ("MODEL_NAME", MODEL_NAME),
-            ("API_KEY", API_KEY),
-        )
-        if not value
-    ]
-    if missing:
-        missing_text = ", ".join(missing)
-        raise RuntimeError(f"Missing required environment variables: {missing_text}")
-
-
-def _clean_error_message(exc: Exception) -> str:
-    return " ".join(str(exc).split())
-
-
 async def connect_env() -> ProteinFoldingEnvClient:
-    """Create an environment client using URL if provided, else docker image."""
-    if OPENENV_BASE_URL:
-        for method_name in ("from_url", "from_base_url", "from_endpoint"):
-            method = getattr(ProteinFoldingEnvClient, method_name, None)
-            if method is None:
-                continue
-            try:
-                client = method(OPENENV_BASE_URL)
-                if asyncio.iscoroutine(client):
-                    client = await client
-                return client
-            except TypeError:
-                continue
-
-    if LOCAL_IMAGE_NAME:
-        return await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
-
-    raise RuntimeError(
-        "No environment connection configured. Set LOCAL_IMAGE_NAME for docker or OPENENV_BASE_URL/ENV_BASE_URL for HTTP."
-    )
+    """Create an environment client from the configured docker image."""
+    return await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME or "protein-env:latest")
 
 
 async def main() -> None:
     """Run one inference episode with LLM-selected structural actions."""
-    ensure_required_env()
-    client = OpenAI(base_url=os.environ["API_BASE_URL"], api_key=os.environ["API_KEY"])
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     current_task = TASK_ID
     steps_taken = 0
     rewards: list[float] = []
     final_score = 0.0
     success = False
     env: ProteinFoldingEnvClient | None = None
-    startup_error: str | None = None
+    observation: ProteinObservation | None = None
     log_start(task=current_task, env="protein_folding", model=MODEL_NAME)
     try:
-        try:
-            env = await connect_env()
-        except Exception as exc:  # noqa: BLE001
-            startup_error = _clean_error_message(exc)
-            return
+        env = await connect_env()
 
         result = await env.reset(seed=EPISODE_SEED, task_id=current_task)
         observation = result.observation
@@ -516,17 +473,16 @@ async def main() -> None:
             )
             history.append(f"Step {step}: {action_desc} -> reward {reward:.2f}")
 
-        metadata_score = float(getattr(observation, "metadata", {}).get("score", 0.0) or 0.0)
-        final_score = metadata_score if metadata_score > 0.0 else estimate_score_from_observation(observation, initial_energy)
-        final_score = max(0.0, min(1.0, final_score))
-        success = final_score >= 0.7
+        if observation is not None:
+            metadata_score = float(getattr(observation, "metadata", {}).get("score", 0.0) or 0.0)
+            final_score = metadata_score if metadata_score > 0.0 else estimate_score_from_observation(observation, initial_energy)
+            final_score = max(0.0, min(1.0, final_score))
+            success = final_score >= 0.7
     finally:
         try:
             if env is not None:
                 await env.close()
         finally:
-            if startup_error:
-                log_step(step=1, action="startup", reward=0.0, done=True, error=startup_error)
             log_end(success=success, steps=steps_taken, score=final_score, rewards=rewards)
 
 
