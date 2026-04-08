@@ -1,12 +1,10 @@
 """Baseline inference script for the protein folding OpenEnv environment.
-
 MANDATORY
 - Before running, define the following environment variables:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     API_KEY        The validator-injected API key for the LLM proxy.
     HF_TOKEN       (Alternative) Your Hugging Face / API key.
-
 - This script is named `inference.py` and is placed in the project root.
 - All LLM calls are made through the OpenAI client.
 """
@@ -198,7 +196,6 @@ SYSTEM_PROMPT = textwrap.dedent(
     """
     You are controlling a simplified protein folding environment.
     Your job is to choose exactly one structural action that improves the protein conformation.
-
     Return exactly one JSON object with this schema:
     {
       "action_type": "rotate_phi | rotate_psi | pivot_rotation | segment_flip | crankshaft_move | end_move_forward | end_move_backward",
@@ -207,7 +204,6 @@ SYSTEM_PROMPT = textwrap.dedent(
       "segment_end": int or null,
       "angle_delta": number or null
     }
-
     Rules:
     - Use only one of the candidate actions provided in the user message.
     - Return valid JSON only.
@@ -350,18 +346,13 @@ def build_user_prompt(
         Task: {task_id}
         Mission: {goal_statement}
         Objective: lower energy, reduce collisions, and improve hydrophobic packing.
-
         Current environment summary:
         {summarize_observation(observation)}
-
         {f"CRITICAL: You currently have {observation.collisions} collisions. Fix these immediately!" if observation.collisions > 0 else ""}
-
         Recent action history:
         {history_text}
-
         Candidate actions:
         {chr(10).join(candidate_lines)}
-
         Choose exactly one candidate and return only the JSON object for that action.
         """
     ).strip()
@@ -403,9 +394,10 @@ def parse_action_response(
 
 
 async def connect_env() -> ProteinFoldingEnvClient:
-    """Create an environment client from the configured docker image."""
+    """Connect to the environment — remote URL if available, else local Docker."""
+    if OPENENV_BASE_URL:
+        return ProteinFoldingEnvClient(base_url=OPENENV_BASE_URL)
     return await ProteinFoldingEnvClient.from_docker_image(LOCAL_IMAGE_NAME or "protein-env:latest")
-
 
 async def main() -> None:
     """Run one inference episode with LLM-selected structural actions."""
